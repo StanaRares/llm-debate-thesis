@@ -4,5 +4,8 @@ env/
 __pycache__/
 *.pyc
 .env
-output/
+outputs/
 logs/
+debate_logs/
+streamlit-*.log
+~$*.docx

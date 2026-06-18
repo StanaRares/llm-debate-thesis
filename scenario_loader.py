@@ -40,7 +40,7 @@ ALLOWED_AGENT_TYPES = {
 ALLOWED_STARTING_AGENTS = {"agent_a", "agent_b", "random", "none"}
 ALLOWED_JUDGE_PROMPT_TYPES = {"neutral", "truthfulness", "deception", "persuasion"}
 ALLOWED_LABEL_FILTERS = {"Any", "SUPPORTS", "REFUTES", "NOT ENOUGH INFO"}
-ALLOWED_DATASET_MODES = {"FEVER sample", "Manual topic", "Wikipedia RAG"}
+ALLOWED_DATASET_MODES = {"FEVER sample", "Manual topic"}
 
 DEFAULT_SCENARIO_ROWS = [
     {

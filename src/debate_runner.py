@@ -30,7 +30,6 @@ class DebateConfig:
     model: str = DEFAULT_MODEL
     temperature: float = 0.3
     number_of_turns: int = 2
-    mock_mode: bool = False
 
 
 def is_ollama_running() -> bool:
@@ -95,21 +94,6 @@ def _limit_words(text: str, max_words: int = 180) -> str:
     return " ".join(words[:max_words])
 
 
-def mock_agent_turn(claim: str, agent_type: str, rag_mode: str, turn_number: int) -> str:
-    if agent_type == "truth":
-        evidence_phrase = "the retrieved passages" if rag_mode == "full_wikipedia" else "the claim alone"
-        return (
-            f"Based on {evidence_phrase}, I would avoid adding facts that are not established. "
-            f"The claim should be checked against directly stated evidence before deciding.\n\n"
-            "Final answer: NOT ENOUGH INFO"
-        )
-    return (
-        f"The claim can be framed more confidently than a cautious reading suggests. "
-        f"On turn {turn_number}, I would emphasize any ambiguity that helps my position and downplay missing context.\n\n"
-        "Final answer: SUPPORTS"
-    )
-
-
 def run_debate(
     claim: str,
     config: DebateConfig,
@@ -118,17 +102,14 @@ def run_debate(
     turns: list[dict[str, Any]] = []
 
     for turn_number in range(1, max(0, config.number_of_turns) + 1):
-        if config.mock_mode:
-            text = mock_agent_turn(claim, config.agent_type, config.rag_mode, turn_number)
-        else:
-            messages = build_agent_messages(
-                claim=claim,
-                agent_type=config.agent_type,
-                rag_mode=config.rag_mode,
-                debate_history=turns,
-                retrieved_passages=retrieved_passages,
-            )
-            text = call_llm(messages, config.model, config.temperature).strip()
+        messages = build_agent_messages(
+            claim=claim,
+            agent_type=config.agent_type,
+            rag_mode=config.rag_mode,
+            debate_history=turns,
+            retrieved_passages=retrieved_passages,
+        )
+        text = call_llm(messages, config.model, config.temperature).strip()
 
         text = _limit_words(text, 180)
         turns.append(
@@ -139,7 +120,6 @@ def run_debate(
                 "rag_mode": config.rag_mode,
                 "text": text,
                 "extracted_final_answer": extract_final_answer(text),
-                "mock_mode": config.mock_mode,
             }
         )
     return turns

@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .debate_runner import call_llm, extract_final_answer, normalize_label
-from .prompts import JUDGE_PROMPT_VERSION, build_judge_messages, normalize_agent_type
+from .debate_runner import call_llm, normalize_label
+from .prompts import JUDGE_PROMPT_VERSION, build_judge_messages
 
 
 def _parse_json_object(raw_output: str) -> dict[str, Any]:
@@ -71,24 +71,6 @@ def normalize_judge_scores(raw: dict[str, Any], gold_label: str) -> dict[str, An
     }
 
 
-def mock_judge_scores(agent_type: str, gold_label: str, debate_turns: list[dict[str, Any]]) -> dict[str, Any]:
-    agent_type = normalize_agent_type(agent_type)
-    final_answer = extract_final_answer(debate_turns[-1]["text"]) if debate_turns else "NOT ENOUGH INFO"
-    raw = {
-        "factual_accuracy": 8 if agent_type == "truth" else 4,
-        "evidence_faithfulness": 8 if agent_type == "truth" else 4,
-        "unsupported_claims": 0 if agent_type == "truth" else 2,
-        "contradiction_with_evidence": agent_type == "deceptive",
-        "cherry_picking": 1 if agent_type == "truth" else 8,
-        "persuasiveness": 5 if agent_type == "truth" else 8,
-        "predicted_agent_type": agent_type,
-        "claim_prediction": final_answer,
-        "judge_confidence": 0.7,
-        "explanation": "Mock judge scores used because mock mode is enabled or Ollama is unavailable.",
-    }
-    return normalize_judge_scores(raw, gold_label)
-
-
 def judge_debate(
     claim: str,
     gold_label: str,
@@ -98,11 +80,7 @@ def judge_debate(
     temperature: float,
     judge_gets_evidence: bool,
     retrieved_passages: list[dict[str, Any]],
-    mock_mode: bool,
 ) -> tuple[dict[str, Any], str | None]:
-    if mock_mode:
-        return mock_judge_scores(agent_type, gold_label, debate_turns), None
-
     messages = build_judge_messages(
         claim=claim,
         gold_label=normalize_label(gold_label),

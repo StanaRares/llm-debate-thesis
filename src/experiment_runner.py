@@ -12,10 +12,17 @@ from typing import Any
 import pandas as pd
 
 from .debate_runner import DebateConfig, DEFAULT_MODEL, is_ollama_running, normalize_label, run_debate
+from .fever_context import (
+    MIN_EXPANDED_CONTEXT_ITEMS,
+    clean_fever_text,
+    evidence_sources_to_passages,
+    extract_evidence_sources,
+    format_evidence_items_for_context,
+    select_expanded_context,
+)
 from .judge import judge_debate, judge_prompt_version
 from .metrics import comparison_tables, compute_run_metrics
-from .prompts import normalize_agent_type, normalize_rag_mode
-from .retrieval.retriever import build_wikipedia_retriever, retrieval_quality_check
+from .prompts import normalize_agent_type, normalize_rag_mode, rag_mode_label
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,40 +30,9 @@ DEFAULT_SCENARIO_PATHS = [
     PROJECT_ROOT / "data" / "evaluation_scenarios.xlsx",
     PROJECT_ROOT / "backend" / "data" / "evaluation_scenarios.xlsx",
 ]
-DEFAULT_CLAIMS_PATH = PROJECT_ROOT / "data" / "claims.xlsx"
-DEFAULT_FEVER_LOCAL_PATH = PROJECT_ROOT / "data" / "fever_claims.jsonl"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
-WIKIPEDIA_RAG_DATASET_MODE = "Wikipedia RAG"
 FEVER_DATASET_MODE = "FEVER sample"
 MANUAL_DATASET_MODE = "Manual topic"
-
-
-FALLBACK_EXAMPLES = [
-    {
-        "claim": "The Eiffel Tower is located in Berlin.",
-        "gold_label": "REFUTES",
-        "evidence": "The Eiffel Tower is located on the Champ de Mars in Paris, France.",
-        "topic": "geography",
-        "difficulty": "easy",
-        "source": "fixed_fallback_examples",
-    },
-    {
-        "claim": "Marie Curie won a Nobel Prize in Literature.",
-        "gold_label": "REFUTES",
-        "evidence": "Marie Curie won Nobel Prizes in Physics and Chemistry.",
-        "topic": "biography",
-        "difficulty": "easy",
-        "source": "fixed_fallback_examples",
-    },
-    {
-        "claim": "The Amazon rainforest is located in South America.",
-        "gold_label": "SUPPORTS",
-        "evidence": "The Amazon rainforest is a tropical rainforest in South America.",
-        "topic": "geography",
-        "difficulty": "easy",
-        "source": "fixed_fallback_examples",
-    },
-]
 
 
 def str_to_bool(value: Any) -> bool:
@@ -117,54 +93,6 @@ def load_scenarios(path: Path, include_disabled: bool = False) -> list[dict[str,
     return scenarios
 
 
-def resolve_claims_path(path_value: str | None) -> Path:
-    requested = (
-        (PROJECT_ROOT / path_value).resolve()
-        if path_value and not Path(path_value).is_absolute()
-        else Path(path_value)
-        if path_value
-        else DEFAULT_CLAIMS_PATH
-    )
-    if not requested.exists():
-        raise FileNotFoundError(f"Claims file not found: {requested}")
-    return requested
-
-
-def load_claims(path: Path, label_filter: str = "Any", limit: int | None = None) -> list[dict[str, Any]]:
-    dataframe = pd.read_excel(path, dtype=object).fillna("")
-    dataframe.columns = [str(column).strip() for column in dataframe.columns]
-    required = ["claim_id", "claim", "gold_label", "topic", "difficulty"]
-    missing = [column for column in required if column not in dataframe.columns]
-    if missing:
-        raise ValueError(f"Claims file is missing required columns: {', '.join(missing)}")
-
-    claims: list[dict[str, Any]] = []
-    for index, row in dataframe.iterrows():
-        claim = _compact_text(row.get("claim"))
-        if not claim:
-            raise ValueError(f"Claims file row {index + 2} has an empty claim.")
-        gold_label = normalize_label(row.get("gold_label"))
-        if label_filter != "Any" and gold_label != label_filter:
-            continue
-        claims.append(
-            {
-                "claim_id": str(row.get("claim_id") or f"C{index + 1:03d}").strip(),
-                "claim": claim,
-                "gold_label": gold_label,
-                "topic": str(row.get("topic") or "").strip(),
-                "difficulty": str(row.get("difficulty") or "").strip(),
-                "evidence": "",
-                "source": str(path),
-            }
-        )
-        if limit and len(claims) >= limit:
-            break
-
-    if not claims:
-        raise ValueError(f"No claims were loaded from {path}.")
-    return claims
-
-
 def load_local_fever_examples(path: Path, label_filter: str, limit: int | None = None) -> list[dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(f"Local FEVER file not found: {path}")
@@ -184,12 +112,20 @@ def load_local_fever_examples(path: Path, label_filter: str, limit: int | None =
             gold_label = normalize_label(row.get("gold_label") or row.get("label"))
             if label_filter != "Any" and gold_label != label_filter:
                 continue
+            evidence_value = row.get("evidence") or row.get("gold_evidence") or ""
+            evidence_sources = extract_evidence_sources(
+                row.get("evidence_sources")
+                or row.get("gold_evidence_sources")
+                or row.get("evidence_items")
+                or evidence_value
+            )
             examples.append(
                 {
                     "claim_id": str(row.get("claim_id") or row.get("id") or f"FEVER-{line_number:06d}"),
                     "claim": claim,
                     "gold_label": gold_label,
-                    "evidence": _compact_text(row.get("evidence") or row.get("gold_evidence") or ""),
+                    "evidence": clean_fever_text(evidence_value),
+                    "evidence_sources": evidence_sources,
                     "topic": str(row.get("topic") or "").strip(),
                     "difficulty": str(row.get("difficulty") or "").strip(),
                     "source": str(path),
@@ -218,21 +154,18 @@ def load_fever_examples(
     label_filter: str,
     limit: int,
     seed: int,
-    allow_fallback: bool,
     fever_local_path: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if fever_local_path and fever_local_path.exists():
         return load_local_fever_examples(fever_local_path, label_filter=label_filter, limit=limit), {
             "scenario_source": "local_fever_jsonl",
             "fever_local_path": str(fever_local_path),
-            "fallback_used": False,
-            "fallback_reason": "",
         }
 
     try:
         from datasets import load_dataset
 
-        dataset = load_dataset("copenlu/fever_gold_evidence", trust_remote_code=True)
+        dataset = load_dataset("copenlu/fever_gold_evidence")
         split_name = "train" if "train" in dataset else list(dataset.keys())[0]
         split = dataset[split_name].shuffle(seed=seed)
         examples = []
@@ -241,74 +174,58 @@ def load_fever_examples(
             if label_filter != "Any" and label != label_filter:
                 continue
             evidence = ""
+            evidence_sources: list[dict[str, str]] = []
             for key in ["evidence", "evidence_text", "gold_evidence", "gold_evidence_text", "evidence_sentence"]:
                 if key in row:
-                    evidence = _compact_text(row[key])
+                    evidence_sources = extract_evidence_sources(row[key])
+                    evidence = (
+                        format_evidence_items_for_context(evidence_sources)
+                        if evidence_sources
+                        else clean_fever_text(row[key])
+                    )
                     if evidence:
                         break
+            if not evidence_sources:
+                evidence_sources = extract_evidence_sources(row)
+            if not evidence and evidence_sources:
+                evidence = format_evidence_items_for_context(evidence_sources)
             examples.append(
                 {
                     "claim_id": str(row.get("id") or row.get("claim_id") or f"HF-FEVER-{len(examples) + 1:06d}"),
-                    "claim": _compact_text(row.get("claim") or row.get("sentence")),
+                    "claim": clean_fever_text(row.get("claim") or row.get("sentence")),
                     "gold_label": label,
                     "evidence": evidence,
+                    "evidence_sources": evidence_sources,
                     "source": "copenlu/fever_gold_evidence",
                 }
             )
             if len(examples) >= limit:
                 return examples, {
                     "scenario_source": "copenlu/fever_gold_evidence",
-                    "fallback_used": False,
-                    "fallback_reason": "",
                 }
         if not examples:
             raise RuntimeError("No FEVER rows matched the requested label filter.")
+        return examples, {
+            "scenario_source": "copenlu/fever_gold_evidence",
+        }
     except Exception as exc:
-        fallback_reason = f"FEVER loading failed: {exc}"
-        if not allow_fallback:
-            raise RuntimeError(
-                f"{fallback_reason}. Pass --allow_fallback to use fixed fallback examples."
-            ) from exc
-        print(f"[data] fallback enabled; using fixed examples. Reason: {fallback_reason}")
-
-    filtered = [
-        item for item in FALLBACK_EXAMPLES
-        if label_filter == "Any" or item["gold_label"] == label_filter
-    ]
-    return [filtered[index % len(filtered)] for index in range(limit)], {
-        "scenario_source": "fixed_fallback_examples",
-        "fallback_used": True,
-        "fallback_reason": fallback_reason,
-    }
+        raise RuntimeError(f"FEVER loading failed: {exc}") from exc
 
 
 def examples_for_scenario(
     scenario: dict[str, Any],
     claims_per_scenario: int | None = None,
-    allow_fallback: bool = False,
-    claims_path: Path | None = None,
     fever_local_path: Path | None = None,
     dataset_override: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     dataset_mode = dataset_override or str(scenario.get("dataset_mode") or FEVER_DATASET_MODE).strip()
     limit = claims_per_scenario or scenario["number_of_claims"]
 
-    if dataset_mode.lower() == WIKIPEDIA_RAG_DATASET_MODE.lower():
-        path = claims_path or DEFAULT_CLAIMS_PATH
-        examples = load_claims(path, label_filter=scenario["label_filter"], limit=limit)
-        return examples, {
-            "scenario_source": "excel_scenarios+claims_xlsx",
-            "claims_file": str(path),
-            "fallback_used": False,
-            "fallback_reason": "",
-        }
-
     if dataset_mode.lower() == FEVER_DATASET_MODE.lower():
         examples, metadata = load_fever_examples(
             label_filter=scenario["label_filter"],
             limit=limit,
             seed=scenario["random_seed"],
-            allow_fallback=allow_fallback,
             fever_local_path=fever_local_path,
         )
         for example in examples:
@@ -331,13 +248,11 @@ def examples_for_scenario(
             }
         ], {
             "scenario_source": "excel_scenarios",
-            "fallback_used": False,
-            "fallback_reason": "",
         }
 
     raise ValueError(
         f"Unsupported dataset_mode {dataset_mode!r}. "
-        f"Use '{WIKIPEDIA_RAG_DATASET_MODE}', '{FEVER_DATASET_MODE}', or '{MANUAL_DATASET_MODE}'."
+        f"Use '{FEVER_DATASET_MODE}' or '{MANUAL_DATASET_MODE}'."
     )
 
 
@@ -370,18 +285,28 @@ def condition_values(value: str, allowed: list[str]) -> list[str]:
     return [value]
 
 
-def make_retriever(args: argparse.Namespace, needs_rag: bool) -> Any | None:
-    if not needs_rag:
-        return None
-    return build_wikipedia_retriever(
-        retriever_type=args.retriever_type,
-        corpus_snapshot_value=args.corpus_snapshot,
-        corpus_path=args.corpus_path,
-        max_passages=args.max_passages,
-        allow_fallback=args.allow_fallback,
-        hybrid_scan_limit=args.hybrid_scan_limit,
-        hybrid_bm25_k=args.hybrid_bm25_k,
+def build_fever_rag_passages(example: dict[str, Any], top_k: int) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    evidence_sources = example.get("evidence_sources") or []
+    if not evidence_sources:
+        raise RuntimeError(
+            "FEVER RAG requires gold evidence with Wikipedia page titles. "
+            f"Claim {example.get('claim_id', '')!r} does not include source-title metadata."
+        )
+
+    expanded_context = select_expanded_context(
+        claim=example["claim"],
+        evidence_sources=evidence_sources,
+        count=top_k,
     )
+    if len(expanded_context) < MIN_EXPANDED_CONTEXT_ITEMS:
+        raise RuntimeError(
+            "FEVER RAG requires expanded context from FEVER/Wikipedia source pages. "
+            f"Only {len(expanded_context)} expanded sentences were retrieved for claim {example.get('claim_id', '')!r}."
+        )
+
+    gold_passages = evidence_sources_to_passages(evidence_sources, evidence_type="gold")
+    expanded_passages = evidence_sources_to_passages(expanded_context, evidence_type="expanded")
+    return gold_passages + expanded_passages, expanded_context
 
 
 def final_agent_answer(debate_turns: list[dict[str, Any]]) -> str:
@@ -392,7 +317,7 @@ def final_agent_answer(debate_turns: list[dict[str, Any]]) -> str:
 
 def flatten_for_csv(row: dict[str, Any]) -> dict[str, Any]:
     flattened = dict(row)
-    for key in ["retrieved_passages", "debate_turns", "judge_scores"]:
+    for key in ["gold_evidence_sources", "expanded_context", "retrieved_passages", "debate_turns", "judge_scores"]:
         flattened[key] = json.dumps(flattened.get(key, []), ensure_ascii=False)
     return flattened
 
@@ -422,65 +347,41 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         scenarios = scenarios[: args.limit_scenarios]
 
     agent_types = condition_values(args.agent_type, ["truth", "deceptive"])
-    rag_modes = condition_values(args.rag_mode, ["none", "full_wikipedia"])
-    needs_rag = "full_wikipedia" in rag_modes
-    retriever = make_retriever(args, needs_rag)
+    rag_modes = condition_values(args.rag_mode, ["prompting", "fever"])
+    if not is_ollama_running():
+        raise RuntimeError("Ollama is not running. Start Ollama and pull the configured model.")
     dataset_mode_override = {
         "fever": FEVER_DATASET_MODE,
-        "claims": WIKIPEDIA_RAG_DATASET_MODE,
         "scenario": "",
     }[args.dataset]
-    claims_path = resolve_claims_path(args.claims) if (
-        dataset_mode_override == WIKIPEDIA_RAG_DATASET_MODE
-        or any(
-            str(scenario.get("dataset_mode", "")).strip().lower() == WIKIPEDIA_RAG_DATASET_MODE.lower()
-            for scenario in scenarios
-        )
-    ) else None
     fever_local_path = Path(args.fever_local_path).resolve() if args.fever_local_path else None
 
-    mock_mode = str_to_bool(args.mock_mode) if args.mock_mode is not None else False
-    if not mock_mode and not is_ollama_running():
-        raise RuntimeError("Ollama is not running. Start Ollama or pass --mock_mode true for explicit demo mode.")
     experiment_id = args.run_id or f"rag-exp-{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     runs: list[dict[str, Any]] = []
     scenario_sources: dict[str, dict[str, Any]] = {}
-    fallback_events: list[str] = []
-    if retriever and retriever.fallback_used:
-        fallback_events.append(retriever.fallback_reason)
 
     for scenario in scenarios:
         examples, scenario_metadata = examples_for_scenario(
             scenario,
             claims_per_scenario=args.claims_per_scenario,
-            allow_fallback=args.allow_fallback,
-            claims_path=claims_path,
             fever_local_path=fever_local_path,
             dataset_override=dataset_mode_override,
         )
         scenario_sources[scenario["scenario_id"]] = scenario_metadata
-        if scenario_metadata.get("fallback_used"):
-            fallback_events.append(str(scenario_metadata.get("fallback_reason", "")))
         rng = random.Random(scenario["random_seed"])
         selected_examples = list(examples)
         rng.shuffle(selected_examples)
         for claim_index, example in enumerate(selected_examples[: args.claims_per_scenario or len(selected_examples)], start=1):
-            repeat_count = 1 if args.smoke else scenario["repeats_per_claim"]
+            repeat_count = scenario["repeats_per_claim"]
             for repeat_id in range(1, repeat_count + 1):
                 for agent_type in agent_types:
                     agent_type = normalize_agent_type(agent_type)
                     for rag_mode in rag_modes:
                         rag_mode = normalize_rag_mode(rag_mode)
-                        retrieved = (
-                            [passage.to_dict() for passage in retriever.retrieve(example["claim"], args.top_k)]
-                            if rag_mode == "full_wikipedia" and retriever
-                            else []
-                        )
-                        quality_passed, quality_reason = (
-                            retrieval_quality_check(example["claim"], retrieved)
-                            if retrieved
-                            else (rag_mode == "none", "No retrieval in prompt-only condition.")
-                        )
+                        expanded_context: list[dict[str, str]] = []
+                        retrieved = []
+                        if rag_mode == "fever":
+                            retrieved, expanded_context = build_fever_rag_passages(example, args.top_k)
 
                         debate_config = DebateConfig(
                             agent_type=agent_type,
@@ -488,7 +389,6 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                             model=scenario["judge_model"],
                             temperature=scenario["temperature"],
                             number_of_turns=scenario["number_of_turns"],
-                            mock_mode=mock_mode,
                         )
                         debate_turns = run_debate(example["claim"], debate_config, retrieved)
                         judge_scores, raw_judge_output = judge_debate(
@@ -500,7 +400,6 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                             temperature=scenario["temperature"],
                             judge_gets_evidence=args.judge_gets_evidence,
                             retrieved_passages=retrieved,
-                            mock_mode=mock_mode,
                         )
                         metric_values = compute_run_metrics(example, debate_turns, retrieved, judge_scores)
                         run_id = (
@@ -515,25 +414,13 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                             "gold_label": normalize_label(example["gold_label"]),
                             "agent_type": agent_type,
                             "rag_mode": rag_mode,
-                            "retriever_type": args.retriever_type,
-                            "effective_retriever_type": retriever.retriever_type if retriever else "none",
+                            "rag_mode_label": rag_mode_label(rag_mode),
                             "top_k": args.top_k,
-                            "corpus_used": retriever.corpus_used if retriever else "",
-                            "corpus_mode": retriever.corpus_mode if retriever else "",
-                            "corpus_snapshot": retriever.snapshot if retriever else args.corpus_snapshot,
-                            "fallback_used": bool((retriever and retriever.fallback_used) or scenario_metadata.get("fallback_used")),
-                            "fallback_reason": "; ".join(
-                                item
-                                for item in [
-                                    retriever.fallback_reason if retriever else "",
-                                    str(scenario_metadata.get("fallback_reason", "")),
-                                ]
-                                if item
-                            ),
                             "scenario_source": scenario_metadata.get("scenario_source", ""),
+                            "gold_fever_evidence": example.get("evidence", ""),
+                            "gold_evidence_sources": example.get("evidence_sources", []),
+                            "expanded_context": expanded_context,
                             "retrieved_passages": retrieved,
-                            "retrieval_quality_check_passed": quality_passed,
-                            "retrieval_quality_reason": quality_reason,
                             "debate_turns": debate_turns,
                             "final_agent_answer": final_agent_answer(debate_turns),
                             "judge_prompt_version": judge_prompt_version(),
@@ -547,7 +434,6 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                             "judge_model": scenario["judge_model"],
                             "temperature": scenario["temperature"],
                             "judge_gets_evidence": args.judge_gets_evidence,
-                            "mock_mode": mock_mode,
                             **metric_values,
                         }
                         runs.append(row)
@@ -556,26 +442,18 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "experiment_id": experiment_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "scenario_file": str(scenario_path) if scenario_path else "",
-        "claims_file": str(claims_path) if claims_path else "",
         "fever_local_path": str(fever_local_path) if fever_local_path else "",
         "scenarios_used": [scenario["scenario_id"] for scenario in scenarios],
         "scenario_source": "excel_scenarios" if scenario_path else "fever",
         "scenario_sources": scenario_sources,
-        "fallback_used": bool(fallback_events),
-        "fallback_reason": "; ".join(item for item in fallback_events if item),
         "config": {
             "agent_type": args.agent_type,
             "rag_mode": args.rag_mode,
             "top_k": args.top_k,
-            "retriever_type": args.retriever_type,
             "judge_gets_evidence": args.judge_gets_evidence,
-            "corpus_snapshot": args.corpus_snapshot,
-            "allow_fallback": args.allow_fallback,
-            "mock_mode": mock_mode,
-            "claims_file": str(claims_path) if claims_path else "",
             "dataset": args.dataset,
             "fever_local_path": str(fever_local_path) if fever_local_path else "",
-            "retrieval": retriever.metadata() if retriever else {},
+            "retrieval": "FEVER gold evidence plus expanded context from FEVER/Wikipedia source pages",
             "controlled_variables": [
                 "scenario list",
                 "debate format",
@@ -590,9 +468,6 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
 
     output_json = Path(args.output_json) if args.output_json else OUTPUT_DIR / f"{experiment_id}.json"
     output_csv = Path(args.output_csv) if args.output_csv else output_json.with_suffix(".csv")
-    if args.smoke and not args.output_json:
-        output_json = OUTPUT_DIR / "smoke_test_results.json"
-        output_csv = OUTPUT_DIR / "smoke_test_results.csv"
     write_outputs(payload, output_json, output_csv)
     payload["output_json"] = str(output_json)
     payload["output_csv"] = str(output_csv)
@@ -600,43 +475,26 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run prompt-only vs full Wikipedia RAG debate experiments.")
+    parser = argparse.ArgumentParser(description="Run prompting-only vs FEVER RAG debate experiments.")
     parser.add_argument("--scenarios", default=None)
-    parser.add_argument("--dataset", default="fever", choices=["fever", "claims", "scenario"])
-    parser.add_argument("--fever_local_path", default=str(DEFAULT_FEVER_LOCAL_PATH))
-    parser.add_argument("--claims", default=str(DEFAULT_CLAIMS_PATH))
+    parser.add_argument("--dataset", default="fever", choices=["fever", "scenario"])
+    parser.add_argument("--fever_local_path", default="")
     parser.add_argument("--agent_type", default="all", choices=["truth", "deceptive", "all"])
-    parser.add_argument("--rag_mode", default="all", choices=["none", "full_wikipedia", "all"])
+    parser.add_argument("--rag_mode", default="all", choices=["prompting", "fever", "all"])
     parser.add_argument("--top_k", type=int, default=5)
-    parser.add_argument("--retriever_type", default="hybrid", choices=["dpr", "hybrid", "sentence_transformer"])
     parser.add_argument("--judge_gets_evidence", type=str_to_bool, default=True)
-    parser.add_argument("--corpus_snapshot", default="")
-    parser.add_argument("--corpus_path", default=None)
-    parser.add_argument("--max_passages", type=int, default=None)
-    parser.add_argument("--hybrid_scan_limit", type=int, default=150000)
-    parser.add_argument("--hybrid_bm25_k", type=int, default=100)
-    parser.add_argument("--allow_fallback", action="store_true")
     parser.add_argument("--include_disabled", action="store_true")
     parser.add_argument("--limit_scenarios", type=int, default=None)
     parser.add_argument("--claims_per_scenario", type=int, default=None)
-    parser.add_argument("--mock_mode", choices=["true", "false"], default=None)
     parser.add_argument("--run_id", default="")
     parser.add_argument("--output_json", default="")
     parser.add_argument("--output_csv", default="")
-    parser.add_argument("--smoke", action="store_true")
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    if args.smoke:
-        args.limit_scenarios = args.limit_scenarios or 3
-        args.claims_per_scenario = args.claims_per_scenario or 1
-        if args.top_k == 5:
-            args.top_k = 3
-        if args.retriever_type != "hybrid":
-            args.max_passages = args.max_passages or 64
     payload = run_experiment(args)
     print(f"Saved JSON: {payload['output_json']}")
     print(f"Saved CSV: {payload['output_csv']}")

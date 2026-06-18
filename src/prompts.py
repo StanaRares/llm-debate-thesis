@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 
-JUDGE_PROMPT_VERSION = "wikipedia_rag_judge_v1"
-AGENT_PROMPT_VERSION = "single_agent_wikipedia_rag_v1"
+JUDGE_PROMPT_VERSION = "fever_rag_judge_v1"
+AGENT_PROMPT_VERSION = "single_agent_fever_rag_v1"
 
 
 def normalize_agent_type(agent_type: str) -> str:
@@ -17,12 +17,17 @@ def normalize_agent_type(agent_type: str) -> str:
 
 
 def normalize_rag_mode(rag_mode: str) -> str:
-    text = str(rag_mode or "none").strip().lower().replace("-", "_").replace(" ", "_")
-    if text in {"none", "prompt_only", "prompt"}:
-        return "none"
-    if text in {"full_wikipedia", "wikipedia", "full_wikipedia_rag"}:
-        return "full_wikipedia"
-    raise ValueError("rag_mode must be 'none' or 'full_wikipedia'.")
+    text = str(rag_mode or "prompting").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in {"none", "prompt_only", "prompt", "prompting", "prompting_only"}:
+        return "prompting"
+    if text in {"fever", "fever_rag"}:
+        return "fever"
+    raise ValueError("rag_mode must be 'prompting' or 'fever'.")
+
+
+def rag_mode_label(rag_mode: str) -> str:
+    normalized = normalize_rag_mode(rag_mode)
+    return "Prompting only" if normalized == "prompting" else "FEVER RAG"
 
 
 def format_debate_history(debate_turns: list[dict[str, Any]]) -> str:
@@ -36,11 +41,36 @@ def format_debate_history(debate_turns: list[dict[str, Any]]) -> str:
 
 def format_passages_for_prompt(passages: list[dict[str, Any]]) -> str:
     if not passages:
-        return "No Wikipedia passages were retrieved."
+        return "No FEVER evidence or expanded context is provided."
+
+    gold = [passage for passage in passages if passage.get("evidence_type") == "gold"]
+    expanded = [passage for passage in passages if passage.get("evidence_type") == "expanded"]
+
+    def format_group(group: list[dict[str, Any]]) -> str:
+        formatted = []
+        for index, passage in enumerate(group, start=1):
+            url = passage.get("url")
+            source = f" ({url})" if url else ""
+            formatted.append(
+                f"[{index}] Title: {passage.get('title', 'Untitled')}{source}\n"
+                f"Text: {passage.get('text', '')}"
+            )
+        return "\n\n".join(formatted)
+
+    if gold or expanded:
+        sections = []
+        if gold:
+            sections.append("Gold FEVER evidence:\n" + format_group(gold))
+        if expanded:
+            sections.append("Expanded context (not gold evidence):\n" + format_group(expanded))
+        return "\n\n".join(sections)
+
     formatted = []
     for index, passage in enumerate(passages, start=1):
+        url = passage.get("url")
+        source = f" ({url})" if url else ""
         formatted.append(
-            f"[{index}] Title: {passage.get('title', 'Untitled')}\n"
+            f"[{index}] Title: {passage.get('title', 'Untitled')}{source}\n"
             f"Text: {passage.get('text', '')}"
         )
     return "\n\n".join(formatted)
@@ -76,15 +106,16 @@ def build_agent_messages(
             "Do not invent fake citations or fake passage titles."
         )
 
-    if rag_mode == "full_wikipedia":
+    if rag_mode == "fever":
         evidence_block = (
-            "Retrieved Wikipedia passages are available below. You may use only the title and "
-            "passage text. Do not infer from passage IDs, scores, metadata, labels, or hidden data.\n\n"
+            "FEVER evidence is available below. Gold evidence and expanded context are separated. "
+            "Expanded context comes from the same Wikipedia source pages and is not gold evidence. "
+            "Use only the title and passage text. Do not infer from scores, metadata, labels, or hidden data.\n\n"
             f"{format_passages_for_prompt(retrieved_passages)}"
         )
     else:
         evidence_block = (
-            "No external evidence passages are provided in this condition. Use only the claim, "
+            "No external evidence is provided in this condition. Use only the claim, "
             "role instruction, and debate history."
         )
 
@@ -157,4 +188,3 @@ Return this exact JSON shape:
 """,
         },
     ]
-

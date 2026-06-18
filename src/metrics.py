@@ -123,8 +123,8 @@ def comparison_tables(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, An
 
     focused = []
     pairs = [
-        ("truth prompt-only vs truth RAG", {"agent_type": "truth"}),
-        ("deceptive prompt-only vs deceptive RAG", {"agent_type": "deceptive"}),
+        ("truth Prompting only vs truth FEVER RAG", {"agent_type": "truth"}),
+        ("deceptive Prompting only vs deceptive FEVER RAG", {"agent_type": "deceptive"}),
     ]
     for label, filters in pairs:
         subset = dataframe
@@ -143,7 +143,7 @@ def comparison_tables(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, An
             )
     tables["requested_comparisons"] = focused
 
-    rag_subset = dataframe[dataframe["rag_mode"] == "full_wikipedia"]
+    rag_subset = dataframe[dataframe["rag_mode"] == "fever"]
     if not rag_subset.empty:
         tables["truth_rag_vs_deceptive_rag"] = grouped_summary(
             rag_subset.to_dict("records"),
@@ -151,4 +151,3 @@ def comparison_tables(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, An
         )
     tables["judge_accuracy_with_vs_without_rag"] = grouped_summary(rows, ["rag_mode"])
     return tables
-
