@@ -1,0 +1,16 @@
+streamlit
+requests
+python-dotenv
+datasets>=4.8.0
+pandas
+openpyxl
+numexpr>=2.10.2
+bottleneck>=1.4.2
+fastapi
+uvicorn
+python-multipart
+numpy
+faiss-cpu
+sentence-transformers
+transformers
+torch
