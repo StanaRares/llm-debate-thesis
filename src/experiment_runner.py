@@ -9,18 +9,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
-
+from scenario_loader import expand_scenario_effective_runs, load_evaluation_scenarios
 from .debate_runner import DebateConfig, DEFAULT_MODEL, is_ollama_running, normalize_label, run_debate
 from .fever_context import (
-    MIN_EXPANDED_CONTEXT_ITEMS,
     clean_fever_text,
     evidence_sources_to_passages,
     extract_evidence_sources,
     format_evidence_items_for_context,
     select_expanded_context,
 )
-from .judge import judge_debate, judge_prompt_version
+from .judge import judge_debate, judge_prompt_version, normalize_agent_type_label
 from .metrics import comparison_tables, compute_run_metrics
 from .prompts import normalize_agent_type, normalize_rag_mode, rag_mode_label
 
@@ -82,12 +80,7 @@ def normalize_scenario_row(row: dict[str, Any], row_number: int) -> dict[str, An
 
 
 def load_scenarios(path: Path, include_disabled: bool = False) -> list[dict[str, Any]]:
-    dataframe = pd.read_excel(path, dtype=object).fillna("")
-    rows = [
-        normalize_scenario_row(row.to_dict(), row_number=index + 1)
-        for index, row in dataframe.iterrows()
-    ]
-    scenarios = [row for row in rows if include_disabled or row["enabled"]]
+    scenarios = load_evaluation_scenarios(include_disabled=include_disabled, path=path)
     if not scenarios:
         raise ValueError("No enabled scenarios were found.")
     return scenarios
@@ -259,18 +252,30 @@ def examples_for_scenario(
 def default_fever_scenario() -> dict[str, Any]:
     return {
         "scenario_id": "FEVER",
+        "scenario_group": "",
+        "row_type": "single_run",
         "scenario_name": "Default FEVER scenario",
         "description": "Default scenario generated because no Excel scenario file was provided.",
         "enabled": True,
+        "agent_a_type": "truth",
+        "agent_b_type": "deceptive",
+        "starting_agent": "agent_a",
         "number_of_turns": 2,
         "number_of_claims": 1,
         "repeats_per_claim": 1,
         "random_seed": 42,
+        "agent_model": DEFAULT_MODEL,
         "judge_model": DEFAULT_MODEL,
         "judge_prompt_type": "neutral",
         "temperature": 0.3,
         "label_filter": "Any",
         "dataset_mode": "FEVER sample",
+        "rag_mode": "fever",
+        "judge_gets_evidence": True,
+        "expanded_context_sentences": 3,
+        "compare_prompting_only": False,
+        "compare_fever_rag": False,
+        "save_transcripts": False,
         "topic": "",
         "difficulty": "",
         "claim": "",
@@ -285,7 +290,7 @@ def condition_values(value: str, allowed: list[str]) -> list[str]:
     return [value]
 
 
-def build_fever_rag_passages(example: dict[str, Any], top_k: int) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def build_fever_rag_passages(example: dict[str, Any], expanded_context_sentences: int) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     evidence_sources = example.get("evidence_sources") or []
     if not evidence_sources:
         raise RuntimeError(
@@ -293,15 +298,19 @@ def build_fever_rag_passages(example: dict[str, Any], top_k: int) -> tuple[list[
             f"Claim {example.get('claim_id', '')!r} does not include source-title metadata."
         )
 
+    expanded_context_sentences = max(0, int(expanded_context_sentences))
+    if expanded_context_sentences == 0:
+        return evidence_sources_to_passages(evidence_sources, evidence_type="gold"), []
+
     expanded_context = select_expanded_context(
         claim=example["claim"],
         evidence_sources=evidence_sources,
-        count=top_k,
+        count=expanded_context_sentences,
     )
-    if len(expanded_context) < MIN_EXPANDED_CONTEXT_ITEMS:
+    if len(expanded_context) < expanded_context_sentences:
         raise RuntimeError(
             "FEVER RAG requires expanded context from FEVER/Wikipedia source pages. "
-            f"Only {len(expanded_context)} expanded sentences were retrieved for claim {example.get('claim_id', '')!r}."
+            f"Only {len(expanded_context)} of {expanded_context_sentences} expanded sentences were retrieved for claim {example.get('claim_id', '')!r}."
         )
 
     gold_passages = evidence_sources_to_passages(evidence_sources, evidence_type="gold")
@@ -317,7 +326,7 @@ def final_agent_answer(debate_turns: list[dict[str, Any]]) -> str:
 
 def flatten_for_csv(row: dict[str, Any]) -> dict[str, Any]:
     flattened = dict(row)
-    for key in ["gold_evidence_sources", "expanded_context", "retrieved_passages", "debate_turns", "judge_scores"]:
+    for key in ["scenario_config", "gold_evidence_sources", "expanded_context", "retrieved_passages", "debate_turns", "judge_scores"]:
         flattened[key] = json.dumps(flattened.get(key, []), ensure_ascii=False)
     return flattened
 
@@ -343,11 +352,16 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         if scenario_path
         else [default_fever_scenario()]
     )
+    if not scenario_path:
+        scenarios[0]["rag_mode"] = "compare" if args.rag_mode == "all" else normalize_rag_mode(args.rag_mode)
+        scenarios[0]["row_type"] = "mode_comparison" if args.rag_mode == "all" else "single_run"
+        scenarios[0]["compare_prompting_only"] = args.rag_mode in {"all", "prompting"}
+        scenarios[0]["compare_fever_rag"] = args.rag_mode in {"all", "fever"}
+        scenarios[0]["judge_gets_evidence"] = args.judge_gets_evidence
+        scenarios[0]["expanded_context_sentences"] = args.top_k
     if args.limit_scenarios:
         scenarios = scenarios[: args.limit_scenarios]
 
-    agent_types = condition_values(args.agent_type, ["truth", "deceptive"])
-    rag_modes = condition_values(args.rag_mode, ["prompting", "fever"])
     if not is_ollama_running():
         raise RuntimeError("Ollama is not running. Start Ollama and pull the configured model.")
     dataset_mode_override = {
@@ -371,22 +385,35 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         rng = random.Random(scenario["random_seed"])
         selected_examples = list(examples)
         rng.shuffle(selected_examples)
-        for claim_index, example in enumerate(selected_examples[: args.claims_per_scenario or len(selected_examples)], start=1):
-            repeat_count = scenario["repeats_per_claim"]
-            for repeat_id in range(1, repeat_count + 1):
-                for agent_type in agent_types:
-                    agent_type = normalize_agent_type(agent_type)
-                    for rag_mode in rag_modes:
-                        rag_mode = normalize_rag_mode(rag_mode)
+        effective_runs = expand_scenario_effective_runs(scenario)
+        scenario_agent_types = []
+        if scenario_path:
+            for key in ["agent_a_type", "agent_b_type"]:
+                value = scenario.get(key)
+                if value and value != "none" and value not in scenario_agent_types:
+                    scenario_agent_types.append(value)
+            if not scenario_agent_types:
+                scenario_agent_types = ["truth"]
+        else:
+            scenario_agent_types = condition_values(args.agent_type, ["truth", "deceptive"])
+
+        for effective_scenario in effective_runs:
+            effective_rag_mode = normalize_rag_mode(effective_scenario["effective_rag_mode"])
+            expanded_context_count = int(effective_scenario["effective_expanded_context_sentences"])
+            for claim_index, example in enumerate(selected_examples[: args.claims_per_scenario or len(selected_examples)], start=1):
+                repeat_count = scenario["repeats_per_claim"]
+                for repeat_id in range(1, repeat_count + 1):
+                    for agent_type in scenario_agent_types:
+                        agent_type = normalize_agent_type(agent_type)
                         expanded_context: list[dict[str, str]] = []
                         retrieved = []
-                        if rag_mode == "fever":
-                            retrieved, expanded_context = build_fever_rag_passages(example, args.top_k)
+                        if effective_rag_mode == "fever":
+                            retrieved, expanded_context = build_fever_rag_passages(example, expanded_context_count)
 
                         debate_config = DebateConfig(
                             agent_type=agent_type,
-                            rag_mode=rag_mode,
-                            model=scenario["judge_model"],
+                            rag_mode=effective_rag_mode,
+                            model=scenario["agent_model"],
                             temperature=scenario["temperature"],
                             number_of_turns=scenario["number_of_turns"],
                         )
@@ -398,25 +425,32 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                             agent_type=agent_type,
                             model=scenario["judge_model"],
                             temperature=scenario["temperature"],
-                            judge_gets_evidence=args.judge_gets_evidence,
+                            judge_gets_evidence=bool(scenario["judge_gets_evidence"]),
                             retrieved_passages=retrieved,
+                        )
+                        judge_scores["judge_correct"] = (
+                            judge_scores.get("claim_prediction") == normalize_label(example["gold_label"])
                         )
                         metric_values = compute_run_metrics(example, debate_turns, retrieved, judge_scores)
                         run_id = (
                             f"{experiment_id}-{scenario['scenario_id']}-C{claim_index:03d}-"
-                            f"R{repeat_id}-{agent_type}-{rag_mode}"
+                            f"R{repeat_id}-{agent_type}-{effective_rag_mode}"
                         )
                         row = {
                             "run_id": run_id,
                             "scenario_id": scenario["scenario_id"],
+                            "effective_rag_mode": effective_rag_mode,
+                            "parent_row_type": scenario["row_type"],
                             "claim": example["claim"],
                             "claim_id": example.get("claim_id", f"C{claim_index:03d}"),
                             "gold_label": normalize_label(example["gold_label"]),
                             "agent_type": agent_type,
-                            "rag_mode": rag_mode,
-                            "rag_mode_label": rag_mode_label(rag_mode),
-                            "top_k": args.top_k,
+                            "rag_mode": effective_rag_mode,
+                            "rag_mode_label": rag_mode_label(effective_rag_mode),
+                            "top_k": expanded_context_count,
+                            "expanded_context_sentences": expanded_context_count,
                             "scenario_source": scenario_metadata.get("scenario_source", ""),
+                            "scenario_config": scenario,
                             "gold_fever_evidence": example.get("evidence", ""),
                             "gold_evidence_sources": example.get("evidence_sources", []),
                             "expanded_context": expanded_context,
@@ -426,14 +460,19 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                             "judge_prompt_version": judge_prompt_version(),
                             "judge_scores": judge_scores,
                             "judge_predicted_agent_type": judge_scores.get("predicted_agent_type"),
+                            "judge_agent_type_correct": (
+                                normalize_agent_type_label(judge_scores.get("predicted_agent_type"))
+                                == normalize_agent_type_label(agent_type)
+                            ),
                             "judge_correct": bool(judge_scores.get("judge_correct")),
                             "raw_judge_output": raw_judge_output,
                             "topic": example.get("topic") or scenario.get("topic", ""),
                             "difficulty": example.get("difficulty") or scenario.get("difficulty", ""),
                             "number_of_turns": scenario["number_of_turns"],
+                            "agent_model": scenario["agent_model"],
                             "judge_model": scenario["judge_model"],
                             "temperature": scenario["temperature"],
-                            "judge_gets_evidence": args.judge_gets_evidence,
+                            "judge_gets_evidence": scenario["judge_gets_evidence"],
                             **metric_values,
                         }
                         runs.append(row)

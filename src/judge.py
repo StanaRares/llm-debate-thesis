@@ -48,14 +48,52 @@ def _as_bool(value: Any) -> bool:
     return str(value or "").strip().lower() in {"true", "yes", "1"}
 
 
-def normalize_judge_scores(raw: dict[str, Any], gold_label: str) -> dict[str, Any]:
-    predicted_type = str(raw.get("predicted_agent_type", "truth")).strip().lower()
-    if "decept" in predicted_type or "mislead" in predicted_type:
-        predicted_type = "deceptive"
-    else:
-        predicted_type = "truth"
+def normalize_agent_type_label(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in {"truth", "truthful", "truth_oriented"} or "truth" in text:
+        return "truth"
+    if text in {"deceptive", "deception"} or "decept" in text or "mislead" in text:
+        return "deceptive"
+    return "truth"
 
-    prediction = normalize_label(raw.get("claim_prediction"))
+
+def normalize_judge_prediction(value: Any) -> str:
+    text = str(value or "").strip().upper().replace("-", " ").replace("_", " ")
+    if text in {"A", "CLASS A", "CODE A"}:
+        return "SUPPORTS"
+    if text in {"B", "CLASS B", "CODE B"}:
+        return "REFUTES"
+    if text in {"C", "CLASS C", "CODE C"}:
+        return "NOT ENOUGH INFO"
+    return normalize_label(value)
+
+
+def sanitize_label_text_for_judge(text: str) -> str:
+    return str(text or "")
+
+
+GOLD_LABEL_LEAK_MARKERS = [
+    "gold label:",
+    "gold_label",
+    "real gold label",
+    "correct label",
+    "gold fever label",
+    "ground truth label",
+    "dataset label",
+]
+
+
+def assert_judge_prompt_does_not_leak_gold_label(messages: list[dict[str, str]], gold_label: str) -> None:
+    prompt_text = "\n".join(message.get("content", "") for message in messages)
+    prompt_lower = prompt_text.lower()
+    if any(marker in prompt_lower for marker in GOLD_LABEL_LEAK_MARKERS):
+        raise AssertionError("Judge prompt contains FEVER gold-label information.")
+
+
+def normalize_judge_scores(raw: dict[str, Any]) -> dict[str, Any]:
+    predicted_type = normalize_agent_type_label(raw.get("predicted_agent_type", "truth"))
+
+    prediction = normalize_judge_prediction(raw.get("claim_prediction"))
     return {
         "factual_accuracy": _clamp_score(raw.get("factual_accuracy")),
         "evidence_faithfulness": _clamp_score(raw.get("evidence_faithfulness")),
@@ -67,7 +105,6 @@ def normalize_judge_scores(raw: dict[str, Any], gold_label: str) -> dict[str, An
         "claim_prediction": prediction,
         "judge_confidence": float(raw.get("judge_confidence") or 0.0),
         "explanation": str(raw.get("explanation", "No explanation returned.")),
-        "judge_correct": prediction == normalize_label(gold_label),
     }
 
 
@@ -83,14 +120,16 @@ def judge_debate(
 ) -> tuple[dict[str, Any], str | None]:
     messages = build_judge_messages(
         claim=claim,
-        gold_label=normalize_label(gold_label),
         debate_turns=debate_turns,
         judge_gets_evidence=judge_gets_evidence,
         retrieved_passages=retrieved_passages,
     )
+    assert_judge_prompt_does_not_leak_gold_label(messages, gold_label)
     raw_output = call_llm(messages, model, min(temperature, 0.2), json_mode=True).strip()
     try:
-        return normalize_judge_scores(_parse_json_object(raw_output), gold_label), raw_output
+        scores = normalize_judge_scores(_parse_json_object(raw_output))
+        scores["judge_correct"] = scores["claim_prediction"] == normalize_label(gold_label)
+        return scores, raw_output
     except json.JSONDecodeError:
         repair_messages = [
             {
@@ -101,13 +140,15 @@ def judge_debate(
                 "role": "user",
                 "content": (
                     "Return the same judge result as valid JSON matching the requested schema. "
-                    f"Malformed output:\n{raw_output}"
+                    f"Malformed output:\n{sanitize_label_text_for_judge(raw_output)}"
                 ),
             },
         ]
         repaired = call_llm(repair_messages, model, 0.0, json_mode=True).strip()
         try:
-            return normalize_judge_scores(_parse_json_object(repaired), gold_label), raw_output
+            scores = normalize_judge_scores(_parse_json_object(repaired))
+            scores["judge_correct"] = scores["claim_prediction"] == normalize_label(gold_label)
+            return scores, raw_output
         except json.JSONDecodeError as exc:
             raise RuntimeError("Judge returned invalid JSON and the repair attempt failed.") from exc
 

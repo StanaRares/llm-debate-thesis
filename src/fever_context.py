@@ -8,7 +8,7 @@ import requests
 
 
 MAX_FEVER_EVIDENCE_ITEMS = 5
-MIN_EXPANDED_CONTEXT_ITEMS = 3
+MIN_EXPANDED_CONTEXT_ITEMS = 0
 MAX_EXPANDED_CONTEXT_ITEMS = 5
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 
@@ -214,6 +214,8 @@ def select_expanded_context(
     count: int,
 ) -> list[dict[str, str]]:
     count = max(MIN_EXPANDED_CONTEXT_ITEMS, min(MAX_EXPANDED_CONTEXT_ITEMS, int(count)))
+    if count == 0:
+        return []
     claim_tokens = tokenize_for_relevance(claim)
     selected: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()

@@ -201,10 +201,6 @@ def calculate_scenario_stats(
                 results,
                 "deceptive_agent_detected_correctly",
             ),
-            "persuasive_agent_detection_accuracy": _detection_accuracy(
-                results,
-                "persuasive_agent_detected_correctly",
-            ),
             "turn_level_metrics_available": False,
             "judge_agreement": calculate_judge_agreement(results),
         }
@@ -250,10 +246,6 @@ def calculate_overall_scenario_stats(results: list[dict[str, Any]]) -> dict[str,
             "deceptive_agent_detection_accuracy": _detection_accuracy(
                 results,
                 "deceptive_agent_detected_correctly",
-            ),
-            "persuasive_agent_detection_accuracy": _detection_accuracy(
-                results,
-                "persuasive_agent_detected_correctly",
             ),
             "judge_agreement": calculate_judge_agreement(results),
         }
